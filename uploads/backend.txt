@@ -1,0 +1,2687 @@
+const sql = require('mssql');
+require('dotenv').config();
+
+const config = {
+  server: process.env.DB_HOST,
+  port: parseInt(process.env.DB_PORT),
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  options: {
+    encrypt: true,
+    trustServerCertificate: true,
+    enableArithAbort: true,
+    requestTimeout: 30000,
+    connectionTimeout: 30000
+  },
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
+  }
+};
+
+let pool;
+
+const getPool = () => {
+  if (!pool) {
+    pool = new sql.ConnectionPool(config);
+  }
+  return pool;
+};
+
+const connectDatabase = async () => {
+  try {
+    if (!pool) {
+      pool = new sql.ConnectionPool(config);
+    }
+    
+    if (!pool.connected && !pool.connecting) {
+      await pool.connect();
+      console.log('✅ Connected to SQL Server database');
+    }
+    
+    return pool;
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    throw error;
+  }
+};
+
+const closeDatabase = async () => {
+  try {
+    if (pool) {
+      await pool.close();
+      console.log('🔌 Database connection closed');
+    }
+  } catch (error) {
+    console.error('❌ Error closing database connection:', error);
+  }
+};
+
+module.exports = {
+  config,
+  getPool,
+  connectDatabase,
+  closeDatabase,
+  sql
+};
+
+
+
+const { getPool, sql } = require('../config/database');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
+
+class User {
+  constructor(userData) {
+    this.id = userData.id;
+    this.email = userData.email;
+    this.name = userData.name;
+    this.phone = userData.phone;
+    this.role = userData.role;
+    this.loyalty_points = userData.loyalty_points;
+    this.is_active = userData.is_active;
+    this.created_at = userData.created_at;
+    this.updated_at = userData.updated_at;
+  }
+
+  static async create(userData) {
+    try {
+      const pool = getPool();
+      const userId = uuidv4();
+      const hashedPassword = await bcrypt.hash(userData.password, 12);
+
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, userId)
+        .input('email', sql.NVarChar(255), userData.email)
+        .input('password', sql.NVarChar(255), hashedPassword)
+        .input('name', sql.NVarChar(255), userData.name)
+        .input('phone', sql.NVarChar(20), userData.phone || null)
+        .input('role', sql.NVarChar(50), userData.role || 'customer')
+        .query(`
+          INSERT INTO Users (id, email, password, name, phone, role, loyalty_points, is_active, created_at, updated_at)
+          OUTPUT INSERTED.*
+          VALUES (@id, @email, @password, @name, @phone, @role, 0, 1, GETDATE(), GETDATE())
+        `);
+
+      return new User(result.recordset[0]);
+    } catch (error) {
+      throw new Error(`Error creating user: ${error.message}`);
+    }
+  }
+
+  static async findByEmail(email) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('email', sql.NVarChar(255), email)
+        .query(`
+          SELECT * FROM Users 
+          WHERE email = @email AND is_active = 1
+        `);
+
+      return result.recordset.length > 0 ? new User(result.recordset[0]) : null;
+    } catch (error) {
+      throw new Error(`Error finding user by email: ${error.message}`);
+    }
+  }
+
+  static async findById(id) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, id)
+        .query(`
+          SELECT * FROM Users 
+          WHERE id = @id AND is_active = 1
+        `);
+
+      return result.recordset.length > 0 ? new User(result.recordset[0]) : null;
+    } catch (error) {
+      throw new Error(`Error finding user by ID: ${error.message}`);
+    }
+  }
+
+  static async findAll(filters = {}) {
+    try {
+      const pool = getPool();
+      let query = 'SELECT * FROM Users WHERE is_active = 1';
+      const request = pool.request();
+
+      if (filters.role) {
+        query += ' AND role = @role';
+        request.input('role', sql.NVarChar(50), filters.role);
+      }
+
+      if (filters.search) {
+        query += ' AND (name LIKE @search OR email LIKE @search)';
+        request.input('search', sql.NVarChar(255), `%${filters.search}%`);
+      }
+
+      query += ' ORDER BY created_at DESC';
+
+      const result = await request.query(query);
+      return result.recordset.map(user => new User(user));
+    } catch (error) {
+      throw new Error(`Error finding users: ${error.message}`);
+    }
+  }
+
+  async update(updateData) {
+    try {
+      const pool = getPool();
+      const request = pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('updated_at', sql.DateTime, new Date());
+
+      let setParts = ['updated_at = @updated_at'];
+      
+      if (updateData.name) {
+        setParts.push('name = @name');
+        request.input('name', sql.NVarChar(255), updateData.name);
+      }
+      
+      if (updateData.phone) {
+        setParts.push('phone = @phone');
+        request.input('phone', sql.NVarChar(20), updateData.phone);
+      }
+      
+      if (updateData.loyalty_points !== undefined) {
+        setParts.push('loyalty_points = @loyalty_points');
+        request.input('loyalty_points', sql.Int, updateData.loyalty_points);
+      }
+
+      const query = `
+        UPDATE Users 
+        SET ${setParts.join(', ')}
+        OUTPUT INSERTED.*
+        WHERE id = @id AND is_active = 1
+      `;
+
+      const result = await request.query(query);
+      
+      if (result.recordset.length > 0) {
+        Object.assign(this, result.recordset[0]);
+        return this;
+      }
+      
+      return null;
+    } catch (error) {
+      throw new Error(`Error updating user: ${error.message}`);
+    }
+  }
+
+  async validatePassword(password) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .query('SELECT password FROM Users WHERE id = @id');
+
+      if (result.recordset.length === 0) {
+        return false;
+      }
+
+      return await bcrypt.compare(password, result.recordset[0].password);
+    } catch (error) {
+      throw new Error(`Error validating password: ${error.message}`);
+    }
+  }
+
+  async addLoyaltyPoints(points) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('points', sql.Int, points)
+        .query(`
+          UPDATE Users 
+          SET loyalty_points = loyalty_points + @points, updated_at = GETDATE()
+          OUTPUT INSERTED.loyalty_points
+          WHERE id = @id AND is_active = 1
+        `);
+
+      if (result.recordset.length > 0) {
+        this.loyalty_points = result.recordset[0].loyalty_points;
+        return this.loyalty_points;
+      }
+      
+      return null;
+    } catch (error) {
+      throw new Error(`Error adding loyalty points: ${error.message}`);
+    }
+  }
+
+  toJSON() {
+    const { password, ...userWithoutPassword } = this;
+    return userWithoutPassword;
+  }
+}
+
+module.exports = User;
+
+
+const { getPool, sql } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+
+class Service {
+  constructor(serviceData) {
+    this.id = serviceData.id;
+    this.name = serviceData.name;
+    this.description = serviceData.description;
+    this.price = serviceData.price;
+    this.duration = serviceData.duration;
+    this.category = serviceData.category;
+    this.image_url = serviceData.image_url;
+    this.is_active = serviceData.is_active;
+    this.created_at = serviceData.created_at;
+    this.updated_at = serviceData.updated_at;
+  }
+
+  static async create(serviceData) {
+    try {
+      const pool = getPool();
+      const serviceId = uuidv4();
+
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, serviceId)
+        .input('name', sql.NVarChar(255), serviceData.name)
+        .input('description', sql.NText, serviceData.description || null)
+        .input('price', sql.Decimal(10, 2), serviceData.price)
+        .input('duration', sql.Int, serviceData.duration)
+        .input('category', sql.NVarChar(100), serviceData.category || null)
+        .input('image_url', sql.NVarChar(500), serviceData.image_url || null)
+        .query(`
+          INSERT INTO Services (id, name, description, price, duration, category, image_url, is_active, created_at, updated_at)
+          OUTPUT INSERTED.*
+          VALUES (@id, @name, @description, @price, @duration, @category, @image_url, 1, GETDATE(), GETDATE())
+        `);
+
+      return new Service(result.recordset[0]);
+    } catch (error) {
+      throw new Error(`Error creating service: ${error.message}`);
+    }
+  }
+
+  static async findById(id) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, id)
+        .query(`
+          SELECT * FROM Services 
+          WHERE id = @id AND is_active = 1
+        `);
+
+      return result.recordset.length > 0 ? new Service(result.recordset[0]) : null;
+    } catch (error) {
+      throw new Error(`Error finding service by ID: ${error.message}`);
+    }
+  }
+
+  static async findAll(filters = {}) {
+    try {
+      const pool = getPool();
+      let query = 'SELECT * FROM Services WHERE is_active = 1';
+      const request = pool.request();
+
+      if (filters.category) {
+        query += ' AND category = @category';
+        request.input('category', sql.NVarChar(100), filters.category);
+      }
+
+      if (filters.minPrice) {
+        query += ' AND price >= @minPrice';
+        request.input('minPrice', sql.Decimal(10, 2), filters.minPrice);
+      }
+
+      if (filters.maxPrice) {
+        query += ' AND price <= @maxPrice';
+        request.input('maxPrice', sql.Decimal(10, 2), filters.maxPrice);
+      }
+
+      if (filters.search) {
+        query += ' AND (name LIKE @search OR description LIKE @search)';
+        request.input('search', sql.NVarChar(255), `%${filters.search}%`);
+      }
+
+      query += ' ORDER BY name ASC';
+
+      const result = await request.query(query);
+      return result.recordset.map(service => new Service(service));
+    } catch (error) {
+      throw new Error(`Error finding services: ${error.message}`);
+    }
+  }
+
+  static async getCategories() {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .query(`
+          SELECT DISTINCT category 
+          FROM Services 
+          WHERE is_active = 1 AND category IS NOT NULL
+          ORDER BY category ASC
+        `);
+
+      return result.recordset.map(row => row.category);
+    } catch (error) {
+      throw new Error(`Error getting service categories: ${error.message}`);
+    }
+  }
+
+  async update(updateData) {
+    try {
+      const pool = getPool();
+      const request = pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('updated_at', sql.DateTime, new Date());
+
+      let setParts = ['updated_at = @updated_at'];
+      
+      if (updateData.name) {
+        setParts.push('name = @name');
+        request.input('name', sql.NVarChar(255), updateData.name);
+      }
+      
+      if (updateData.description !== undefined) {
+        setParts.push('description = @description');
+        request.input('description', sql.NText, updateData.description);
+      }
+      
+      if (updateData.price) {
+        setParts.push('price = @price');
+        request.input('price', sql.Decimal(10, 2), updateData.price);
+      }
+      
+      if (updateData.duration) {
+        setParts.push('duration = @duration');
+        request.input('duration', sql.Int, updateData.duration);
+      }
+      
+      if (updateData.category !== undefined) {
+        setParts.push('category = @category');
+        request.input('category', sql.NVarChar(100), updateData.category);
+      }
+      
+      if (updateData.image_url !== undefined) {
+        setParts.push('image_url = @image_url');
+        request.input('image_url', sql.NVarChar(500), updateData.image_url);
+      }
+
+      const query = `
+        UPDATE Services 
+        SET ${setParts.join(', ')}
+        OUTPUT INSERTED.*
+        WHERE id = @id AND is_active = 1
+      `;
+
+      const result = await request.query(query);
+      
+      if (result.recordset.length > 0) {
+        Object.assign(this, result.recordset[0]);
+        return this;
+      }
+      
+      return null;
+    } catch (error) {
+      throw new Error(`Error updating service: ${error.message}`);
+    }
+  }
+
+  async delete() {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .query(`
+          UPDATE Services 
+          SET is_active = 0, updated_at = GETDATE()
+          WHERE id = @id AND is_active = 1
+        `);
+
+      return result.rowsAffected[0] > 0;
+    } catch (error) {
+      throw new Error(`Error deleting service: ${error.message}`);
+    }
+  }
+}
+
+module.exports = Service;
+
+
+
+const { getPool, sql } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+
+class Booking {
+  constructor(bookingData) {
+    this.id = bookingData.id;
+    this.user_id = bookingData.user_id;
+    this.service_id = bookingData.service_id;
+    this.staff_id = bookingData.staff_id;
+    this.booking_date = bookingData.booking_date;
+    this.booking_time = bookingData.booking_time;
+    this.status = bookingData.status;
+    this.total_price = bookingData.total_price;
+    this.notes = bookingData.notes;
+    this.created_at = bookingData.created_at;
+    this.updated_at = bookingData.updated_at;
+  }
+
+  static async create(bookingData) {
+    try {
+      const pool = getPool();
+      const bookingId = uuidv4();
+
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, bookingId)
+        .input('user_id', sql.UniqueIdentifier, bookingData.user_id)
+        .input('service_id', sql.UniqueIdentifier, bookingData.service_id)
+        .input('staff_id', sql.UniqueIdentifier, bookingData.staff_id || null)
+        .input('booking_date', sql.Date, bookingData.booking_date)
+        .input('booking_time', sql.Time, bookingData.booking_time)
+        .input('total_price', sql.Decimal(10, 2), bookingData.total_price)
+        .input('notes', sql.NText, bookingData.notes || null)
+        .query(`
+          INSERT INTO Bookings (id, user_id, service_id, staff_id, booking_date, booking_time, status, total_price, notes, created_at, updated_at)
+          OUTPUT INSERTED.*
+          VALUES (@id, @user_id, @service_id, @staff_id, @booking_date, @booking_time, 'pending', @total_price, @notes, GETDATE(), GETDATE())
+        `);
+
+      return new Booking(result.recordset[0]);
+    } catch (error) {
+      throw new Error(`Error creating booking: ${error.message}`);
+    }
+  }
+
+  static async findById(id) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, id)
+        .query(`
+          SELECT 
+            b.*,
+            u.name as user_name,
+            u.email as user_email,
+            u.phone as user_phone,
+            s.name as service_name,
+            s.duration as service_duration,
+            st.name as staff_name
+          FROM Bookings b
+          LEFT JOIN Users u ON b.user_id = u.id
+          LEFT JOIN Services s ON b.service_id = s.id
+          LEFT JOIN Staff st ON b.staff_id = st.id
+          WHERE b.id = @id
+        `);
+
+      return result.recordset.length > 0 ? new Booking(result.recordset[0]) : null;
+    } catch (error) {
+      throw new Error(`Error finding booking by ID: ${error.message}`);
+    }
+  }
+
+  static async findByUserId(userId, filters = {}) {
+    try {
+      const pool = getPool();
+      let query = `
+        SELECT 
+          b.*,
+          s.name as service_name,
+          s.duration as service_duration,
+          st.name as staff_name
+        FROM Bookings b
+        LEFT JOIN Services s ON b.service_id = s.id
+        LEFT JOIN Staff st ON b.staff_id = st.id
+        WHERE b.user_id = @userId
+      `;
+      
+      const request = pool.request()
+        .input('userId', sql.UniqueIdentifier, userId);
+
+      if (filters.status) {
+        query += ' AND b.status = @status';
+        request.input('status', sql.NVarChar(50), filters.status);
+      }
+
+      if (filters.fromDate) {
+        query += ' AND b.booking_date >= @fromDate';
+        request.input('fromDate', sql.Date, filters.fromDate);
+      }
+
+      if (filters.toDate) {
+        query += ' AND b.booking_date <= @toDate';
+        request.input('toDate', sql.Date, filters.toDate);
+      }
+
+      query += ' ORDER BY b.booking_date DESC, b.booking_time DESC';
+
+      const result = await request.query(query);
+      return result.recordset.map(booking => new Booking(booking));
+    } catch (error) {
+      throw new Error(`Error finding bookings by user ID: ${error.message}`);
+    }
+  }
+
+  static async findAll(filters = {}) {
+    try {
+      const pool = getPool();
+      let query = `
+        SELECT 
+          b.*,
+          u.name as user_name,
+          u.email as user_email,
+          u.phone as user_phone,
+          s.name as service_name,
+          s.duration as service_duration,
+          st.name as staff_name
+        FROM Bookings b
+        LEFT JOIN Users u ON b.user_id = u.id
+        LEFT JOIN Services s ON b.service_id = s.id
+        LEFT JOIN Staff st ON b.staff_id = st.id
+        WHERE 1=1
+      `;
+      
+      const request = pool.request();
+
+      if (filters.status) {
+        query += ' AND b.status = @status';
+        request.input('status', sql.NVarChar(50), filters.status);
+      }
+
+      if (filters.staff_id) {
+        query += ' AND b.staff_id = @staff_id';
+        request.input('staff_id', sql.UniqueIdentifier, filters.staff_id);
+      }
+
+      if (filters.date) {
+        query += ' AND b.booking_date = @date';
+        request.input('date', sql.Date, filters.date);
+      }
+
+      if (filters.fromDate) {
+        query += ' AND b.booking_date >= @fromDate';
+        request.input('fromDate', sql.Date, filters.fromDate);
+      }
+
+      if (filters.toDate) {
+        query += ' AND b.booking_date <= @toDate';
+        request.input('toDate', sql.Date, filters.toDate);
+      }
+
+      query += ' ORDER BY b.booking_date DESC, b.booking_time DESC';
+
+      const result = await request.query(query);
+      return result.recordset.map(booking => new Booking(booking));
+    } catch (error) {
+      throw new Error(`Error finding bookings: ${error.message}`);
+    }
+  }
+
+  static async getAvailableSlots(staffId, date) {
+    try {
+      const pool = getPool();
+      
+      // Get all booked slots for the staff on the given date
+      const result = await pool.request()
+        .input('staff_id', sql.UniqueIdentifier, staffId)
+        .input('date', sql.Date, date)
+        .query(`
+          SELECT 
+            b.booking_time,
+            s.duration
+          FROM Bookings b
+          LEFT JOIN Services s ON b.service_id = s.id
+          WHERE b.staff_id = @staff_id 
+            AND b.booking_date = @date 
+            AND b.status IN ('pending', 'confirmed')
+          ORDER BY b.booking_time
+        `);
+
+      const bookedSlots = result.recordset;
+      
+      // Generate all possible time slots (9 AM to 6 PM, 30-minute intervals)
+      const allSlots = [];
+      for (let hour = 9; hour < 18; hour++) {
+        for (let minute = 0; minute < 60; minute += 30) {
+          const timeString = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+          allSlots.push(timeString);
+        }
+      }
+
+      // Filter out booked slots
+      const availableSlots = allSlots.filter(slot => {
+        return !bookedSlots.some(booked => {
+          const bookedTime = booked.booking_time;
+          const bookedDuration = booked.duration || 30;
+          
+          // Convert time strings to minutes for easier calculation
+          const slotMinutes = this.timeToMinutes(slot);
+          const bookedMinutes = this.timeToMinutes(bookedTime);
+          
+          // Check if the slot conflicts with the booked appointment
+          return slotMinutes >= bookedMinutes && slotMinutes < bookedMinutes + bookedDuration;
+        });
+      });
+
+      return availableSlots;
+    } catch (error) {
+      throw new Error(`Error getting available slots: ${error.message}`);
+    }
+  }
+
+  static timeToMinutes(timeString) {
+    const [hours, minutes] = timeString.split(':').map(Number);
+    return hours * 60 + minutes;
+  }
+
+  async updateStatus(status) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('status', sql.NVarChar(50), status)
+        .query(`
+          UPDATE Bookings 
+          SET status = @status, updated_at = GETDATE()
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
+
+      if (result.recordset.length > 0) {
+        this.status = result.recordset[0].status;
+        this.updated_at = result.recordset[0].updated_at;
+        return this;
+      }
+      
+      return null;
+    } catch (error) {
+      throw new Error(`Error updating booking status: ${error.message}`);
+    }
+  }
+
+  async update(updateData) {
+    try {
+      const pool = getPool();
+      const request = pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('updated_at', sql.DateTime, new Date());
+
+      let setParts = ['updated_at = @updated_at'];
+      
+      if (updateData.booking_date) {
+        setParts.push('booking_date = @booking_date');
+        request.input('booking_date', sql.Date, updateData.booking_date);
+      }
+      
+      if (updateData.booking_time) {
+        setParts.push('booking_time = @booking_time');
+        request.input('booking_time', sql.Time, updateData.booking_time);
+      }
+      
+      if (updateData.staff_id) {
+        setParts.push('staff_id = @staff_id');
+        request.input('staff_id', sql.UniqueIdentifier, updateData.staff_id);
+      }
+      
+      if (updateData.notes !== undefined) {
+        setParts.push('notes = @notes');
+        request.input('notes', sql.NText, updateData.notes);
+      }
+
+      const query = `
+        UPDATE Bookings 
+        SET ${setParts.join(', ')}
+        OUTPUT INSERTED.*
+        WHERE id = @id
+      `;
+
+      const result = await request.query(query);
+      
+      if (result.recordset.length > 0) {
+        Object.assign(this, result.recordset[0]);
+        return this;
+      }
+      
+      return null;
+    } catch (error) {
+      throw new Error(`Error updating booking: ${error.message}`);
+    }
+  }
+}
+
+module.exports = Booking;
+
+
+
+const { getPool, sql } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+
+class Staff {
+  constructor(staffData) {
+    this.id = staffData.id;
+    this.name = staffData.name;
+    this.email = staffData.email;
+    this.phone = staffData.phone;
+    this.specialties = staffData.specialties;
+    this.experience_years = staffData.experience_years;
+    this.rating = staffData.rating;
+    this.bio = staffData.bio;
+    this.image_url = staffData.image_url;
+    this.is_active = staffData.is_active;
+    this.created_at = staffData.created_at;
+    this.updated_at = staffData.updated_at;
+  }
+
+  static async create(staffData) {
+    try {
+      const pool = getPool();
+      const staffId = uuidv4();
+
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, staffId)
+        .input('name', sql.NVarChar(255), staffData.name)
+        .input('email', sql.NVarChar(255), staffData.email)
+        .input('phone', sql.NVarChar(20), staffData.phone || null)
+        .input('specialties', sql.NText, staffData.specialties || null)
+        .input('experience_years', sql.Int, staffData.experience_years || 0)
+        .input('bio', sql.NText, staffData.bio || null)
+        .input('image_url', sql.NVarChar(500), staffData.image_url || null)
+        .query(`
+          INSERT INTO Staff (id, name, email, phone, specialties, experience_years, rating, bio, image_url, is_active, created_at, updated_at)
+          OUTPUT INSERTED.*
+          VALUES (@id, @name, @email, @phone, @specialties, @experience_years, 0.0, @bio, @image_url, 1, GETDATE(), GETDATE())
+        `);
+
+      return new Staff(result.recordset[0]);
+    } catch (error) {
+      throw new Error(`Error creating staff: ${error.message}`);
+    }
+  }
+
+  static async findById(id) {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, id)
+        .query(`
+          SELECT * FROM Staff 
+          WHERE id = @id AND is_active = 1
+        `);
+
+      return result.recordset.length > 0 ? new Staff(result.recordset[0]) : null;
+    } catch (error) {
+      throw new Error(`Error finding staff by ID: ${error.message}`);
+    }
+  }
+
+  static async findAll(filters = {}) {
+    try {
+      const pool = getPool();
+      let query = 'SELECT * FROM Staff WHERE is_active = 1';
+      const request = pool.request();
+
+      if (filters.specialty) {
+        query += ' AND specialties LIKE @specialty';
+        request.input('specialty', sql.NVarChar(255), `%${filters.specialty}%`);
+      }
+
+      if (filters.minRating) {
+        query += ' AND rating >= @minRating';
+        request.input('minRating', sql.Decimal(3, 2), filters.minRating);
+      }
+
+      if (filters.search) {
+        query += ' AND (name LIKE @search OR specialties LIKE @search)';
+        request.input('search', sql.NVarChar(255), `%${filters.search}%`);
+      }
+
+      query += ' ORDER BY rating DESC, name ASC';
+
+      const result = await request.query(query);
+      return result.recordset.map(staff => new Staff(staff));
+    } catch (error) {
+      throw new Error(`Error finding staff: ${error.message}`);
+    }
+  }
+
+  static async getAvailableStaff(date, time, serviceDuration = 30) {
+    try {
+      const pool = getPool();
+      
+      // Find staff who don't have conflicting bookings
+      const result = await pool.request()
+        .input('date', sql.Date, date)
+        .input('time', sql.Time, time)
+        .input('duration', sql.Int, serviceDuration)
+        .query(`
+          SELECT s.* FROM Staff s
+          WHERE s.is_active = 1
+            AND s.id NOT IN (
+              SELECT DISTINCT b.staff_id 
+              FROM Bookings b
+              LEFT JOIN Services srv ON b.service_id = srv.id
+              WHERE b.booking_date = @date
+                AND b.staff_id IS NOT NULL
+                AND b.status IN ('pending', 'confirmed')
+                AND (
+                  -- Check for time conflicts
+                  (@time >= b.booking_time AND @time < DATEADD(MINUTE, ISNULL(srv.duration, 30), CAST(@date AS DATETIME) + CAST(b.booking_time AS DATETIME)))
+                  OR 
+                  (DATEADD(MINUTE, @duration, CAST(@date AS DATETIME) + CAST(@time AS DATETIME)) > CAST(@date AS DATETIME) + CAST(b.booking_time AS DATETIME)
+                   AND @time < DATEADD(MINUTE, ISNULL(srv.duration, 30), CAST(@date AS DATETIME) + CAST(b.booking_time AS DATETIME)))
+                )
+            )
+          ORDER BY s.rating DESC, s.name ASC
+        `);
+
+      return result.recordset.map(staff => new Staff(staff));
+    } catch (error) {
+      throw new Error(`Error finding available staff: ${error.message}`);
+    }
+  }
+
+  async update(updateData) {
+    try {
+      const pool = getPool();
+      const request = pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('updated_at', sql.DateTime, new Date());
+
+      let setParts = ['updated_at = @updated_at'];
+      
+      if (updateData.name) {
+        setParts.push('name = @name');
+        request.input('name', sql.NVarChar(255), updateData.name);
+      }
+      
+      if (updateData.email) {
+        setParts.push('email = @email');
+        request.input('email', sql.NVarChar(255), updateData.email);
+      }
+      
+      if (updateData.phone !== undefined) {
+        setParts.push('phone = @phone');
+        request.input('phone', sql.NVarChar(20), updateData.phone);
+      }
+      
+      if (updateData.specialties !== undefined) {
+        setParts.push('specialties = @specialties');
+        request.input('specialties', sql.NText, updateData.specialties);
+      }
+      
+      if (updateData.experience_years !== undefined) {
+        setParts.push('experience_years = @experience_years');
+        request.input('experience_years', sql.Int, updateData.experience_years);
+      }
+      
+      if (updateData.bio !== undefined) {
+        setParts.push('bio = @bio');
+        request.input('bio', sql.NText, updateData.bio);
+      }
+      
+      if (updateData.image_url !== undefined) {
+        setParts.push('image_url = @image_url');
+        request.input('image_url', sql.NVarChar(500), updateData.image_url);
+      }
+
+      const query = `
+        UPDATE Staff 
+        SET ${setParts.join(', ')}
+        OUTPUT INSERTED.*
+        WHERE id = @id AND is_active = 1
+      `;
+
+      const result = await request.query(query);
+      
+      if (result.recordset.length > 0) {
+        Object.assign(this, result.recordset[0]);
+        return this;
+      }
+      
+      return null;
+    } catch (error) {
+      throw new Error(`Error updating staff: ${error.message}`);
+    }
+  }
+
+  async updateRating() {
+    try {
+      const pool = getPool();
+      
+      // Calculate average rating from reviews
+      const result = await pool.request()
+        .input('staff_id', sql.UniqueIdentifier, this.id)
+        .query(`
+          SELECT AVG(CAST(r.rating AS FLOAT)) as avg_rating
+          FROM Reviews r
+          LEFT JOIN Bookings b ON r.booking_id = b.id
+          WHERE b.staff_id = @staff_id
+        `);
+
+      const avgRating = result.recordset[0].avg_rating || 0;
+
+      // Update staff rating
+      await pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .input('rating', sql.Decimal(3, 2), avgRating)
+        .query(`
+          UPDATE Staff 
+          SET rating = @rating, updated_at = GETDATE()
+          WHERE id = @id
+        `);
+
+      this.rating = avgRating;
+      return this.rating;
+    } catch (error) {
+      throw new Error(`Error updating staff rating: ${error.message}`);
+    }
+  }
+
+  async delete() {
+    try {
+      const pool = getPool();
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, this.id)
+        .query(`
+          UPDATE Staff 
+          SET is_active = 0, updated_at = GETDATE()
+          WHERE id = @id AND is_active = 1
+        `);
+
+      return result.rowsAffected[0] > 0;
+    } catch (error) {
+      throw new Error(`Error deleting staff: ${error.message}`);
+    }
+  }
+}
+
+module.exports = Staff;
+
+
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+const { ApiResponse } = require('../utils/ApiResponse');
+const { AppError } = require('../utils/AppError');
+
+class AuthController {
+  static async register(req, res, next) {
+    try {
+      const { email, password, name, phone, role } = req.body;
+
+      // Check if user already exists
+      const existingUser = await User.findByEmail(email);
+      if (existingUser) {
+        throw new AppError('User already exists with this email', 400);
+      }
+
+      // Create new user
+      const user = await User.create({
+        email,
+        password,
+        name,
+        phone,
+        role: role || 'customer'
+      });
+
+      // Generate JWT token
+      const token = jwt.sign(
+        { 
+          userId: user.id, 
+          email: user.email, 
+          role: user.role 
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      res.status(201).json(
+        ApiResponse.success(
+          {
+            user: user.toJSON(),
+            token
+          },
+          'User registered successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async login(req, res, next) {
+    try {
+      const { email, password } = req.body;
+
+      // Find user by email
+      const user = await User.findByEmail(email);
+      if (!user) {
+        throw new AppError('Invalid email or password', 401);
+      }
+
+      // Validate password
+      const isValidPassword = await user.validatePassword(password);
+      if (!isValidPassword) {
+        throw new AppError('Invalid email or password', 401);
+      }
+
+      // Generate JWT token
+      const token = jwt.sign(
+        { 
+          userId: user.id, 
+          email: user.email, 
+          role: user.role 
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      res.json(
+        ApiResponse.success(
+          {
+            user: user.toJSON(),
+            token
+          },
+          'Login successful'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getProfile(req, res, next) {
+    try {
+      const user = await User.findById(req.user.id);
+      if (!user) {
+        throw new AppError('User not found', 404);
+      }
+
+      res.json(
+        ApiResponse.success(
+          { user: user.toJSON() },
+          'Profile retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async updateProfile(req, res, next) {
+    try {
+      const { name, phone } = req.body;
+      const user = await User.findById(req.user.id);
+      
+      if (!user) {
+        throw new AppError('User not found', 404);
+      }
+
+      const updatedUser = await user.update({ name, phone });
+      
+      res.json(
+        ApiResponse.success(
+          { user: updatedUser.toJSON() },
+          'Profile updated successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async refreshToken(req, res, next) {
+    try {
+      const user = await User.findById(req.user.id);
+      if (!user) {
+        throw new AppError('User not found', 404);
+      }
+
+      // Generate new JWT token
+      const token = jwt.sign(
+        { 
+          userId: user.id, 
+          email: user.email, 
+          role: user.role 
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      res.json(
+        ApiResponse.success(
+          { token },
+          'Token refreshed successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async logout(req, res, next) {
+    try {
+      // In a real application, you might want to blacklist the token
+      // For now, we'll just return a success message
+      res.json(
+        ApiResponse.success(
+          null,
+          'Logout successful'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+}
+
+module.exports = AuthController;
+
+
+
+const Service = require('../models/Service');
+const { ApiResponse } = require('../utils/ApiResponse');
+const { AppError } = require('../utils/AppError');
+
+class ServiceController {
+  static async getAllServices(req, res, next) {
+    try {
+      const { category, minPrice, maxPrice, search } = req.query;
+      
+      const filters = {};
+      if (category) filters.category = category;
+      if (minPrice) filters.minPrice = parseFloat(minPrice);
+      if (maxPrice) filters.maxPrice = parseFloat(maxPrice);
+      if (search) filters.search = search;
+
+      const services = await Service.findAll(filters);
+      
+      res.json(
+        ApiResponse.success(
+          { services },
+          'Services retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getServiceById(req, res, next) {
+    try {
+      const { id } = req.params;
+      const service = await Service.findById(id);
+      
+      if (!service) {
+        throw new AppError('Service not found', 404);
+      }
+
+      res.json(
+        ApiResponse.success(
+          { service },
+          'Service retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async createService(req, res, next) {
+    try {
+      const { name, description, price, duration, category, image_url } = req.body;
+      
+      const service = await Service.create({
+        name,
+        description,
+        price,
+        duration,
+        category,
+        image_url
+      });
+
+      res.status(201).json(
+        ApiResponse.success(
+          { service },
+          'Service created successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async updateService(req, res, next) {
+    try {
+      const { id } = req.params;
+      const updateData = req.body;
+      
+      const service = await Service.findById(id);
+      if (!service) {
+        throw new AppError('Service not found', 404);
+      }
+
+      const updatedService = await service.update(updateData);
+      
+      res.json(
+        ApiResponse.success(
+          { service: updatedService },
+          'Service updated successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async deleteService(req, res, next) {
+    try {
+      const { id } = req.params;
+      
+      const service = await Service.findById(id);
+      if (!service) {
+        throw new AppError('Service not found', 404);
+      }
+
+      await service.delete();
+      
+      res.json(
+        ApiResponse.success(
+          null,
+          'Service deleted successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getServiceCategories(req, res, next) {
+    try {
+      const categories = await Service.getCategories();
+      
+      res.json(
+        ApiResponse.success(
+          { categories },
+          'Service categories retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getPopularServices(req, res, next) {
+    try {
+      // This could be enhanced to get actual popular services based on booking data
+      const services = await Service.findAll();
+      
+      // For now, just return first 6 services as "popular"
+      const popularServices = services.slice(0, 6);
+      
+      res.json(
+        ApiResponse.success(
+          { services: popularServices },
+          'Popular services retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+}
+
+module.exports = ServiceController;
+
+
+const Booking = require('../models/Booking');
+const Service = require('../models/Service');
+const Staff = require('../models/Staff');
+const User = require('../models/User');
+const { ApiResponse } = require('../utils/ApiResponse');
+const { AppError } = require('../utils/AppError');
+
+class BookingController {
+  static async createBooking(req, res, next) {
+    try {
+      const { service_id, staff_id, booking_date, booking_time, notes } = req.body;
+      const user_id = req.user.id;
+
+      // Validate service exists
+      const service = await Service.findById(service_id);
+      if (!service) {
+        throw new AppError('Service not found', 404);
+      }
+
+      // Validate staff exists (if provided)
+      if (staff_id) {
+        const staff = await Staff.findById(staff_id);
+        if (!staff) {
+          throw new AppError('Staff member not found', 404);
+        }
+      }
+
+      // Check if the time slot is available
+      if (staff_id) {
+        const availableSlots = await Booking.getAvailableSlots(staff_id, booking_date);
+        if (!availableSlots.includes(booking_time)) {
+          throw new AppError('Selected time slot is not available', 400);
+        }
+      }
+
+      // Create booking
+      const booking = await Booking.create({
+        user_id,
+        service_id,
+        staff_id,
+        booking_date,
+        booking_time,
+        total_price: service.price,
+        notes
+      });
+
+      // Add loyalty points to user (1 point per dollar spent)
+      const user = await User.findById(user_id);
+      await user.addLoyaltyPoints(Math.floor(service.price));
+
+      res.status(201).json(
+        ApiResponse.success(
+          { booking },
+          'Booking created successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getUserBookings(req, res, next) {
+    try {
+      const user_id = req.user.id;
+      const { status, fromDate, toDate } = req.query;
+      
+      const filters = {};
+      if (status) filters.status = status;
+      if (fromDate) filters.fromDate = fromDate;
+      if (toDate) filters.toDate = toDate;
+
+      const bookings = await Booking.findByUserId(user_id, filters);
+      
+      res.json(
+        ApiResponse.success(
+          { bookings },
+          'User bookings retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getAllBookings(req, res, next) {
+    try {
+      const { status, staff_id, date, fromDate, toDate } = req.query;
+      
+      const filters = {};
+      if (status) filters.status = status;
+      if (staff_id) filters.staff_id = staff_id;
+      if (date) filters.date = date;
+      if (fromDate) filters.fromDate = fromDate;
+      if (toDate) filters.toDate = toDate;
+
+      const bookings = await Booking.findAll(filters);
+      
+      res.json(
+        ApiResponse.success(
+          { bookings },
+          'Bookings retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getBookingById(req, res, next) {
+    try {
+      const { id } = req.params;
+      const booking = await Booking.findById(id);
+      
+      if (!booking) {
+        throw new AppError('Booking not found', 404);
+      }
+
+      // Check if user owns this booking or is admin/staff
+      if (req.user.role === 'customer' && booking.user_id !== req.user.id) {
+        throw new AppError('Access denied', 403);
+      }
+
+      res.json(
+        ApiResponse.success(
+          { booking },
+          'Booking retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async updateBookingStatus(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+      
+      const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled'];
+      if (!validStatuses.includes(status)) {
+        throw new AppError('Invalid status', 400);
+      }
+
+      const booking = await Booking.findById(id);
+      if (!booking) {
+        throw new AppError('Booking not found', 404);
+      }
+
+      // Only allow certain role-based status updates
+      if (req.user.role === 'customer') {
+        // Customers can only cancel their own pending bookings
+        if (booking.user_id !== req.user.id || status !== 'cancelled' || booking.status !== 'pending') {
+          throw new AppError('Access denied', 403);
+        }
+      }
+
+      const updatedBooking = await booking.updateStatus(status);
+      
+      res.json(
+        ApiResponse.success(
+          { booking: updatedBooking },
+          'Booking status updated successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async updateBooking(req, res, next) {
+    try {
+      const { id } = req.params;
+      const updateData = req.body;
+      
+      const booking = await Booking.findById(id);
+      if (!booking) {
+        throw new AppError('Booking not found', 404);
+      }
+
+      // Check permissions
+      if (req.user.role === 'customer' && booking.user_id !== req.user.id) {
+        throw new AppError('Access denied', 403);
+      }
+
+      // Customers can only update certain fields and only if booking is pending
+      if (req.user.role === 'customer') {
+        if (booking.status !== 'pending') {
+          throw new AppError('Cannot update confirmed or completed bookings', 400);
+        }
+        
+        // Limit what customers can update
+        const allowedFields = ['booking_date', 'booking_time', 'notes'];
+        const filteredUpdateData = {};
+        allowedFields.forEach(field => {
+          if (updateData[field] !== undefined) {
+            filteredUpdateData[field] = updateData[field];
+          }
+        });
+        updateData = filteredUpdateData;
+      }
+
+      // Validate new time slot if being updated
+      if (updateData.booking_date || updateData.booking_time) {
+        const checkDate = updateData.booking_date || booking.booking_date;
+        const checkTime = updateData.booking_time || booking.booking_time;
+        const checkStaffId = updateData.staff_id || booking.staff_id;
+        
+        if (checkStaffId) {
+          const availableSlots = await Booking.getAvailableSlots(checkStaffId, checkDate);
+          if (!availableSlots.includes(checkTime)) {
+            throw new AppError('Selected time slot is not available', 400);
+          }
+        }
+      }
+
+      const updatedBooking = await booking.update(updateData);
+      
+      res.json(
+        ApiResponse.success(
+          { booking: updatedBooking },
+          'Booking updated successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getAvailableSlots(req, res, next) {
+    try {
+      const { staffId, date } = req.params;
+      
+      // Validate staff exists
+      const staff = await Staff.findById(staffId);
+      if (!staff) {
+        throw new AppError('Staff member not found', 404);
+      }
+
+      const availableSlots = await Booking.getAvailableSlots(staffId, date);
+      
+      res.json(
+        ApiResponse.success(
+          { availableSlots },
+          'Available slots retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getBookingStats(req, res, next) {
+    try {
+      const { fromDate, toDate } = req.query;
+      
+      const filters = {};
+      if (fromDate) filters.fromDate = fromDate;
+      if (toDate) filters.toDate = toDate;
+
+      const allBookings = await Booking.findAll(filters);
+      
+      const stats = {
+        total: allBookings.length,
+        pending: allBookings.filter(b => b.status === 'pending').length,
+        confirmed: allBookings.filter(b => b.status === 'confirmed').length,
+        completed: allBookings.filter(b => b.status === 'completed').length,
+        cancelled: allBookings.filter(b => b.status === 'cancelled').length,
+        totalRevenue: allBookings
+          .filter(b => b.status === 'completed')
+          .reduce((sum, b) => sum + parseFloat(b.total_price || 0), 0)
+      };
+      
+      res.json(
+        ApiResponse.success(
+          { stats },
+          'Booking statistics retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+}
+
+module.exports = BookingController;
+
+
+const Staff = require('../models/Staff');
+const { ApiResponse } = require('../utils/ApiResponse');
+const { AppError } = require('../utils/AppError');
+
+class StaffController {
+  static async getAllStaff(req, res, next) {
+    try {
+      const { specialty, minRating, search } = req.query;
+      
+      const filters = {};
+      if (specialty) filters.specialty = specialty;
+      if (minRating) filters.minRating = parseFloat(minRating);
+      if (search) filters.search = search;
+
+      const staff = await Staff.findAll(filters);
+      
+      res.json(
+        ApiResponse.success(
+          { staff },
+          'Staff members retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getStaffById(req, res, next) {
+    try {
+      const { id } = req.params;
+      const staff = await Staff.findById(id);
+      
+      if (!staff) {
+        throw new AppError('Staff member not found', 404);
+      }
+
+      res.json(
+        ApiResponse.success(
+          { staff },
+          'Staff member retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async createStaff(req, res, next) {
+    try {
+      const { name, email, phone, specialties, experience_years, bio, image_url } = req.body;
+      
+      const staff = await Staff.create({
+        name,
+        email,
+        phone,
+        specialties,
+        experience_years,
+        bio,
+        image_url
+      });
+
+      res.status(201).json(
+        ApiResponse.success(
+          { staff },
+          'Staff member created successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async updateStaff(req, res, next) {
+    try {
+      const { id } = req.params;
+      const updateData = req.body;
+      
+      const staff = await Staff.findById(id);
+      if (!staff) {
+        throw new AppError('Staff member not found', 404);
+      }
+
+      const updatedStaff = await staff.update(updateData);
+      
+      res.json(
+        ApiResponse.success(
+          { staff: updatedStaff },
+          'Staff member updated successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async deleteStaff(req, res, next) {
+    try {
+      const { id } = req.params;
+      
+      const staff = await Staff.findById(id);
+      if (!staff) {
+        throw new AppError('Staff member not found', 404);
+      }
+
+      await staff.delete();
+      
+      res.json(
+        ApiResponse.success(
+          null,
+          'Staff member deleted successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getAvailableStaff(req, res, next) {
+    try {
+      const { date, time, duration } = req.query;
+      
+      if (!date || !time) {
+        throw new AppError('Date and time are required', 400);
+      }
+
+      const serviceDuration = duration ? parseInt(duration) : 30;
+      const availableStaff = await Staff.getAvailableStaff(date, time, serviceDuration);
+      
+      res.json(
+        ApiResponse.success(
+          { staff: availableStaff },
+          'Available staff retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async updateStaffRating(req, res, next) {
+    try {
+      const { id } = req.params;
+      
+      const staff = await Staff.findById(id);
+      if (!staff) {
+        throw new AppError('Staff member not found', 404);
+      }
+
+      const newRating = await staff.updateRating();
+      
+      res.json(
+        ApiResponse.success(
+          { rating: newRating },
+          'Staff rating updated successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getStaffSchedule(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { date, fromDate, toDate } = req.query;
+      
+      const staff = await Staff.findById(id);
+      if (!staff) {
+        throw new AppError('Staff member not found', 404);
+      }
+
+      // Get bookings for this staff member
+      const Booking = require('../models/Booking');
+      const filters = { staff_id: id };
+      
+      if (date) {
+        filters.date = date;
+      } else {
+        if (fromDate) filters.fromDate = fromDate;
+        if (toDate) filters.toDate = toDate;
+      }
+
+      const bookings = await Booking.findAll(filters);
+      
+      res.json(
+        ApiResponse.success(
+          { 
+            staff,
+            bookings 
+          },
+          'Staff schedule retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  static async getTopRatedStaff(req, res, next) {
+    try {
+      const { limit = 5 } = req.query;
+      
+      const staff = await Staff.findAll({ minRating: 0 });
+      
+      // Sort by rating and limit results
+      const topStaff = staff
+        .sort((a, b) => b.rating - a.rating)
+        .slice(0, parseInt(limit));
+      
+      res.json(
+        ApiResponse.success(
+          { staff: topStaff },
+          'Top rated staff retrieved successfully'
+        )
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+}
+
+module.exports = StaffController;
+
+
+
+class ApiResponse {
+  static success(data = null, message = 'Success', statusCode = 200) {
+    return {
+      success: true,
+      statusCode,
+      message,
+      data,
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  static error(message = 'Error', statusCode = 500, errors = null) {
+    return {
+      success: false,
+      statusCode,
+      message,
+      errors,
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  static paginated(data, pagination, message = 'Success') {
+    return {
+      success: true,
+      statusCode: 200,
+      message,
+      data,
+      pagination: {
+        page: pagination.page,
+        limit: pagination.limit,
+        total: pagination.total,
+        pages: Math.ceil(pagination.total / pagination.limit),
+        hasNext: pagination.page < Math.ceil(pagination.total / pagination.limit),
+        hasPrev: pagination.page > 1
+      },
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+module.exports = { ApiResponse };
+
+
+class AppError extends Error {
+  constructor(message, statusCode = 500, isOperational = true) {
+    super(message);
+    
+    this.statusCode = statusCode;
+    this.status = `${statusCode}`.startsWith('4') ? 'fail' : 'error';
+    this.isOperational = isOperational;
+    
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+module.exports = { AppError };
+
+
+const fs = require('fs');
+const path = require('path');
+
+class Logger {
+  constructor() {
+    this.logDir = path.join(__dirname, '../logs');
+    this.ensureLogDirectory();
+  }
+
+  ensureLogDirectory() {
+    if (!fs.existsSync(this.logDir)) {
+      fs.mkdirSync(this.logDir, { recursive: true });
+    }
+  }
+
+  formatMessage(level, message, meta = {}) {
+    return JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: level.toUpperCase(),
+      message,
+      meta,
+      pid: process.pid
+    }) + '\n';
+  }
+
+  writeToFile(filename, content) {
+    const filePath = path.join(this.logDir, filename);
+    fs.appendFileSync(filePath, content);
+  }
+
+  info(message, meta = {}) {
+    const logMessage = this.formatMessage('info', message, meta);
+    console.log(logMessage.trim());
+    this.writeToFile('app.log', logMessage);
+  }
+
+  error(message, meta = {}) {
+    const logMessage = this.formatMessage('error', message, meta);
+    console.error(logMessage.trim());
+    this.writeToFile('error.log', logMessage);
+  }
+
+  warn(message, meta = {}) {
+    const logMessage = this.formatMessage('warn', message, meta);
+    console.warn(logMessage.trim());
+    this.writeToFile('app.log', logMessage);
+  }
+
+  debug(message, meta = {}) {
+    if (process.env.NODE_ENV === 'development') {
+      const logMessage = this.formatMessage('debug', message, meta);
+      console.log(logMessage.trim());
+      this.writeToFile('debug.log', logMessage);
+    }
+  }
+}
+
+module.exports = new Logger();
+
+
+const { ApiResponse } = require('../utils/ApiResponse');
+const { AppError } = require('../utils/AppError');
+const Logger = require('../utils/Logger');
+
+const handleCastErrorDB = (err) => {
+  const message = `Invalid ${err.path}: ${err.value}`;
+  return new AppError(message, 400);
+};
+
+const handleDuplicateFieldsDB = (err) => {
+  const value = err.errmsg.match(/(["'])(\\?.)*?\1/)[0];
+  const message = `Duplicate field value: ${value}. Please use another value!`;
+  return new AppError(message, 400);
+};
+
+const handleValidationErrorDB = (err) => {
+  const errors = Object.values(err.errors).map(el => el.message);
+  const message = `Invalid input data. ${errors.join('. ')}`;
+  return new AppError(message, 400);
+};
+
+const handleJWTError = () =>
+  new AppError('Invalid token. Please log in again!', 401);
+
+const handleJWTExpiredError = () =>
+  new AppError('Your token has expired! Please log in again.', 401);
+
+const sendErrorDev = (err, res) => {
+  res.status(err.statusCode).json(
+    ApiResponse.error(
+      err.message,
+      err.statusCode,
+      {
+        error: err,
+        stack: err.stack
+      }
+    )
+  );
+};
+
+const sendErrorProd = (err, res) => {
+  // Operational, trusted error: send message to client
+  if (err.isOperational) {
+    res.status(err.statusCode).json(
+      ApiResponse.error(err.message, err.statusCode)
+    );
+  } else {
+    // Programming or other unknown error: don't leak error details
+    Logger.error('ERROR 💥', { error: err });
+
+    res.status(500).json(
+      ApiResponse.error('Something went wrong!', 500)
+    );
+  }
+};
+
+const globalErrorHandler = (err, req, res, next) => {
+  err.statusCode = err.statusCode || 500;
+  err.status = err.status || 'error';
+
+  if (process.env.NODE_ENV === 'development') {
+    sendErrorDev(err, res);
+  } else {
+    let error = { ...err };
+    error.message = err.message;
+
+    if (error.name === 'CastError') error = handleCastErrorDB(error);
+    if (error.code === 11000) error = handleDuplicateFieldsDB(error);
+    if (error.name === 'ValidationError') error = handleValidationErrorDB(error);
+    if (error.name === 'JsonWebTokenError') error = handleJWTError();
+    if (error.name === 'TokenExpiredError') error = handleJWTExpiredError();
+
+    sendErrorProd(error, res);
+  }
+};
+
+module.exports = globalErrorHandler;
+
+
+const Logger = require('../utils/Logger');
+
+const requestLogger = (req, res, next) => {
+  const start = Date.now();
+  
+  // Log request
+  Logger.info('Incoming Request', {
+    method: req.method,
+    url: req.url,
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+    body: req.method === 'POST' || req.method === 'PUT' ? req.body : undefined
+  });
+
+  // Override res.json to log response
+  const originalJson = res.json;
+  res.json = function(body) {
+    const duration = Date.now() - start;
+    
+    Logger.info('Response Sent', {
+      method: req.method,
+      url: req.url,
+      statusCode: res.statusCode,
+      duration: `${duration}ms`,
+      responseSize: JSON.stringify(body).length
+    });
+
+    return originalJson.call(this, body);
+  };
+
+  next();
+};
+
+module.exports = requestLogger;
+
+
+const rateLimit = require('express-rate-limit');
+const { ApiResponse } = require('../utils/ApiResponse');
+
+// General API rate limiter
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: ApiResponse.error(
+    'Too many requests from this IP, please try again later.',
+    429
+  ),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Strict rate limiter for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: ApiResponse.error(
+    'Too many authentication attempts from this IP, please try again later.',
+    429
+  ),
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true, // Don't count successful requests
+});
+
+// Booking rate limiter
+const bookingLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // limit each IP to 10 booking requests per hour
+  message: ApiResponse.error(
+    'Too many booking attempts from this IP, please try again later.',
+    429
+  ),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+module.exports = {
+  apiLimiter,
+  authLimiter,
+  bookingLimiter
+};
+
+
+const express = require('express');
+const ServiceController = require('../controllers/ServiceController');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+const { validateRequest, schemas } = require('../middleware/validation');
+
+const router = express.Router();
+
+// Public routes
+router.get('/', ServiceController.getAllServices);
+router.get('/categories', ServiceController.getServiceCategories);
+router.get('/popular', ServiceController.getPopularServices);
+router.get('/:id', ServiceController.getServiceById);
+
+// Protected routes (admin/staff only)
+router.use(authenticateToken);
+router.use(requireRole(['admin', 'staff']));
+
+router.post('/', 
+  validateRequest(schemas.service), 
+  ServiceController.createService
+);
+
+router.put('/:id', 
+  validateRequest(schemas.service), 
+  ServiceController.updateService
+);
+
+router.delete('/:id', ServiceController.deleteService);
+
+module.exports = router;
+
+
+const express = require('express');
+const BookingController = require('../controllers/BookingController');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+const { validateRequest, schemas } = require('../middleware/validation');
+const { bookingLimiter } = require('../middleware/rateLimiter');
+
+const router = express.Router();
+
+// All booking routes require authentication
+router.use(authenticateToken);
+
+// Customer routes
+router.post('/', 
+  bookingLimiter,
+  validateRequest(schemas.booking), 
+  BookingController.createBooking
+);
+
+router.get('/my-bookings', BookingController.getUserBookings);
+router.get('/available-slots/:staffId/:date', BookingController.getAvailableSlots);
+router.get('/:id', BookingController.getBookingById);
+router.put('/:id', BookingController.updateBooking);
+router.patch('/:id/status', BookingController.updateBookingStatus);
+
+// Admin/Staff routes
+router.get('/', 
+  requireRole(['admin', 'staff']), 
+  BookingController.getAllBookings
+);
+
+router.get('/stats/overview', 
+  requireRole(['admin', 'staff']), 
+  BookingController.getBookingStats
+);
+
+module.exports = router;
+
+
+const express = require('express');
+const StaffController = require('../controllers/StaffController');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Public routes
+router.get('/', StaffController.getAllStaff);
+router.get('/top-rated', StaffController.getTopRatedStaff);
+router.get('/available', StaffController.getAvailableStaff);
+router.get('/:id', StaffController.getStaffById);
+router.get('/:id/schedule', StaffController.getStaffSchedule);
+
+// Protected routes (admin only)
+router.use(authenticateToken);
+router.use(requireRole(['admin']));
+
+router.post('/', StaffController.createStaff);
+router.put('/:id', StaffController.updateStaff);
+router.delete('/:id', StaffController.deleteStaff);
+router.patch('/:id/rating', StaffController.updateStaffRating);
+
+module.exports = router;
+
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const path = require('path');
+require('dotenv').config();
+
+// Import database connection
+const { connectDatabase, closeDatabase } = require('./config/database');
+
+// Import middleware
+const globalErrorHandler = require('./middleware/errorHandler');
+const requestLogger = require('./middleware/requestLogger');
+const { apiLimiter } = require('./middleware/rateLimiter');
+
+// Import routes
+const authRoutes = require('./routes/auth');
+const servicesRoutes = require('./routes/services');
+const bookingsRoutes = require('./routes/bookings');
+const barbersRoutes = require('./routes/barbers');
+
+// Import utilities
+const Logger = require('./utils/Logger');
+const { ApiResponse } = require('./utils/ApiResponse');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Security middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+// CORS configuration
+const corsOptions = {
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  credentials: true,
+  optionsSuccessStatus: 200,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+app.use(cors(corsOptions));
+
+// Logging middleware
+if (process.env.NODE_ENV === 'production') {
+  app.use(morgan('combined'));
+} else {
+  app.use(morgan('dev'));
+  app.use(requestLogger);
+}
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Rate limiting
+app.use('/api/', apiLimiter);
+
+// Serve static files
+app.use('/images', express.static(path.join(__dirname, 'public/images')));
+app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
+
+// Health check endpoints
+app.get('/health', (req, res) => {
+  res.json(
+    ApiResponse.success(
+      {
+        server: 'Vietnamese Barbershop API',
+        version: '1.0.0',
+        environment: process.env.NODE_ENV || 'development',
+        database: 'Connected',
+        uptime: process.uptime()
+      },
+      'Server is healthy'
+    )
+  );
+});
+
+app.get('/api/health', (req, res) => {
+  res.json(
+    ApiResponse.success(
+      {
+        server: 'Vietnamese Barbershop API',
+        version: '1.0.0',
+        environment: process.env.NODE_ENV || 'development',
+        database: 'Connected',
+        uptime: process.uptime()
+      },
+      'API is healthy'
+    )
+  );
+});
+
+// API routes
+app.use('/api/auth', authRoutes);
+app.use('/api/services', servicesRoutes);
+app.use('/api/bookings', bookingsRoutes);
+app.use('/api/barbers', barbersRoutes);
+
+// API documentation endpoint
+app.get('/api', (req, res) => {
+  res.json(
+    ApiResponse.success(
+      {
+        message: 'Vietnamese Barbershop API',
+        version: '1.0.0',
+        endpoints: {
+          auth: {
+            'POST /api/auth/register': 'User registration',
+            'POST /api/auth/login': 'User login',
+            'GET /api/auth/profile': 'Get user profile',
+            'PUT /api/auth/profile': 'Update user profile',
+            'POST /api/auth/refresh-token': 'Refresh JWT token',
+            'POST /api/auth/logout': 'User logout'
+          },
+          services: {
+            'GET /api/services': 'Get all services',
+            'GET /api/services/categories': 'Get service categories',
+            'GET /api/services/popular': 'Get popular services',
+            'GET /api/services/:id': 'Get service by ID',
+            'POST /api/services': 'Create service (admin/staff)',
+            'PUT /api/services/:id': 'Update service (admin/staff)',
+            'DELETE /api/services/:id': 'Delete service (admin/staff)'
+          },
+          bookings: {
+            'POST /api/bookings': 'Create booking',
+            'GET /api/bookings/my-bookings': 'Get user bookings',
+            'GET /api/bookings': 'Get all bookings (admin/staff)',
+            'GET /api/bookings/:id': 'Get booking by ID',
+            'PUT /api/bookings/:id': 'Update booking',
+            'PATCH /api/bookings/:id/status': 'Update booking status',
+            'GET /api/bookings/available-slots/:staffId/:date': 'Get available time slots',
+            'GET /api/bookings/stats/overview': 'Get booking statistics (admin/staff)'
+          },
+          barbers: {
+            'GET /api/barbers': 'Get all staff',
+            'GET /api/barbers/top-rated': 'Get top rated staff',
+            'GET /api/barbers/available': 'Get available staff',
+            'GET /api/barbers/:id': 'Get staff by ID',
+            'GET /api/barbers/:id/schedule': 'Get staff schedule',
+            'POST /api/barbers': 'Create staff (admin)',
+            'PUT /api/barbers/:id': 'Update staff (admin)',
+            'DELETE /api/barbers/:id': 'Delete staff (admin)',
+            'PATCH /api/barbers/:id/rating': 'Update staff rating (admin)'
+          }
+        }
+      },
+      'API Documentation'
+    )
+  );
+});
+
+// 404 handler for API routes
+app.use('/api/*', (req, res) => {
+  res.status(404).json(
+    ApiResponse.error('API endpoint not found', 404)
+  );
+});
+
+// 404 handler for all other routes
+app.use('*', (req, res) => {
+  res.status(404).json(
+    ApiResponse.error('Route not found', 404)
+  );
+});
+
+// Global error handler
+app.use(globalErrorHandler);
+
+// Start server with database connection
+const startServer = async () => {
+  try {
+    Logger.info('🔄 Starting Vietnamese Barbershop API server...');
+    
+    // Connect to database
+    await connectDatabase();
+    Logger.info('✅ Database connected successfully');
+    
+    // Start HTTP server
+    const server = app.listen(PORT, () => {
+      Logger.info(`🚀 Vietnamese Barbershop API server running on port ${PORT}`);
+      Logger.info(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
+      Logger.info(`🌐 CORS Origin: ${process.env.CORS_ORIGIN || 'http://localhost:3000'}`);
+      Logger.info(`📊 Health check: http://localhost:${PORT}/health`);
+      Logger.info(`📚 API Documentation: http://localhost:${PORT}/api`);
+      Logger.info(`🗄️  Database: Connected to SQL Server`);
+      
+      console.log(`\n📋 Available API endpoints:`);
+      console.log(`   Authentication:`);
+      console.log(`     POST /api/auth/register - User registration`);
+      console.log(`     POST /api/auth/login - User login`);
+      console.log(`     GET  /api/auth/profile - Get user profile`);
+      console.log(`   Services:`);
+      console.log(`     GET  /api/services - Get all services`);
+      console.log(`     GET  /api/services/:id - Get service by ID`);
+      console.log(`   Staff/Barbers:`);
+      console.log(`     GET  /api/barbers - Get all staff`);
+      console.log(`     GET  /api/barbers/:id - Get staff by ID`);
+      console.log(`   Bookings:`);
+      console.log(`     POST /api/bookings - Create booking`);
+      console.log(`     GET  /api/bookings/my-bookings - Get user bookings`);
+      console.log(`     GET  /api/bookings/available-slots/:staffId/:date - Get available time slots`);
+    });
+
+    // Graceful shutdown handlers
+    const gracefulShutdown = (signal) => {
+      Logger.info(`🛑 ${signal} received, shutting down gracefully...`);
+      
+      server.close(async () => {
+        Logger.info('🔌 HTTP server closed');
+        
+        try {
+          await closeDatabase();
+          Logger.info('✅ Graceful shutdown completed');
+          process.exit(0);
+        } catch (error) {
+          Logger.error('❌ Error during graceful shutdown:', { error: error.message });
+          process.exit(1);
+        }
+      });
+    };
+
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    
+  } catch (error) {
+    Logger.error('❌ Failed to start server:', { error: error.message });
+    process.exit(1);
+  }
+};
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (err, promise) => {
+  Logger.error('🚨 Unhandled Promise Rejection:', { 
+    error: err.message,
+    stack: err.stack 
+  });
+  
+  if (process.env.NODE_ENV === 'production') {
+    process.exit(1);
+  }
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  Logger.error('🚨 Uncaught Exception:', { 
+    error: err.message,
+    stack: err.stack 
+  });
+  
+  process.exit(1);
+});
+
+startServer();
+
+module.exports = app;
+
+
+const Joi = require('joi');
+
+const validateRequest = (schema) => {
+  return (req, res, next) => {
+    const { error } = schema.validate(req.body, { abortEarly: false });
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        errors: error.details.map(detail => ({
+          field: detail.path.join('.'),
+          message: detail.message
+        }))
+      });
+    }
+    next();
+  };
+};
+
+const validateQuery = (schema) => {
+  return (req, res, next) => {
+    const { error } = schema.validate(req.query, { abortEarly: false });
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: 'Query validation error',
+        errors: error.details.map(detail => ({
+          field: detail.path.join('.'),
+          message: detail.message
+        }))
+      });
+    }
+    next();
+  };
+};
+
+const validateParams = (schema) => {
+  return (req, res, next) => {
+    const { error } = schema.validate(req.params, { abortEarly: false });
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: 'Parameter validation error',
+        errors: error.details.map(detail => ({
+          field: detail.path.join('.'),
+          message: detail.message
+        }))
+      });
+    }
+    next();
+  };
+};
+
+// Validation schemas
+const schemas = {
+  // Auth schemas
+  register: Joi.object({
+    email: Joi.string().email().required().messages({
+      'string.email': 'Please provide a valid email address',
+      'any.required': 'Email is required'
+    }),
+    password: Joi.string().min(6).max(128).required().messages({
+      'string.min': 'Password must be at least 6 characters long',
+      'string.max': 'Password must not exceed 128 characters',
+      'any.required': 'Password is required'
+    }),
+    name: Joi.string().min(2).max(100).required().messages({
+      'string.min': 'Name must be at least 2 characters long',
+      'string.max': 'Name must not exceed 100 characters',
+      'any.required': 'Name is required'
+    }),
+    phone: Joi.string().pattern(/^[0-9]{10,11}$/).optional().messages({
+      'string.pattern.base': 'Phone number must be 10-11 digits'
+    }),
+    role: Joi.string().valid('customer', 'staff', 'admin').optional()
+  }),
+
+  login: Joi.object({
+    email: Joi.string().email().required().messages({
+      'string.email': 'Please provide a valid email address',
+      'any.required': 'Email is required'
+    }),
+    password: Joi.string().required().messages({
+      'any.required': 'Password is required'
+    })
+  }),
+
+  updateProfile: Joi.object({
+    name: Joi.string().min(2).max(100).optional(),
+    phone: Joi.string().pattern(/^[0-9]{10,11}$/).optional().allow(''),
+  }),
+
+  // Service schemas
+  service: Joi.object({
+    name: Joi.string().min(2).max(255).required().messages({
+      'string.min': 'Service name must be at least 2 characters long',
+      'string.max': 'Service name must not exceed 255 characters',
+      'any.required': 'Service name is required'
+    }),
+    description: Joi.string().max(1000).optional().allow(''),
+    price: Joi.number().positive().precision(2).required().messages({
+      'number.positive': 'Price must be a positive number',
+      'any.required': 'Price is required'
+    }),
+    duration: Joi.number().integer().min(15).max(480).required().messages({
+      'number.integer': 'Duration must be an integer',
+      'number.min': 'Duration must be at least 15 minutes',
+      'number.max': 'Duration must not exceed 8 hours (480 minutes)',
+      'any.required': 'Duration is required'
+    }),
+    category: Joi.string().max(100).optional().allow(''),
+    image_url: Joi.string().uri().optional().allow('')
+  }),
+
+  // Booking schemas
+  booking: Joi.object({
+    service_id: Joi.string().uuid().required().messages({
+      'string.uuid': 'Service ID must be a valid UUID',
+      'any.required': 'Service ID is required'
+    }),
+    staff_id: Joi.string().uuid().optional().allow(''),
+    booking_date: Joi.date().min('now').required().messages({
+      'date.min': 'Booking date cannot be in the past',
+      'any.required': 'Booking date is required'
+    }),
+    booking_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required().messages({
+      'string.pattern.base': 'Booking time must be in HH:MM format',
+      'any.required': 'Booking time is required'
+    }),
+    notes: Joi.string().max(500).optional().allow('')
+  }),
+
+  updateBooking: Joi.object({
+    booking_date: Joi.date().min('now').optional(),
+    booking_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
+    staff_id: Joi.string().uuid().optional().allow(''),
+    notes: Joi.string().max(500).optional().allow('')
+  }),
+
+  bookingStatus: Joi.object({
+    status: Joi.string().valid('pending', 'confirmed', 'completed', 'cancelled').required()
+  }),
+
+  // Staff schemas
+  staff: Joi.object({
+    name: Joi.string().min(2).max(255).required(),
+    email: Joi.string().email().required(),
+    phone: Joi.string().pattern(/^[0-9]{10,11}$/).optional().allow(''),
+    specialties: Joi.string().max(1000).optional().allow(''),
+    experience_years: Joi.number().integer().min(0).max(50).optional(),
+    bio: Joi.string().max(1000).optional().allow(''),
+    image_url: Joi.string().uri().optional().allow('')
+  }),
+
+  // Review schemas
+  review: Joi.object({
+    booking_id: Joi.string().uuid().required(),
+    rating: Joi.number().integer().min(1).max(5).required(),
+    comment: Joi.string().max(1000).optional().allow('')
+  }),
+
+  // Query parameter schemas
+  bookingQuery: Joi.object({
+    status: Joi.string().valid('pending', 'confirmed', 'completed', 'cancelled').optional(),
+    staff_id: Joi.string().uuid().optional(),
+    date: Joi.date().optional(),
+    fromDate: Joi.date().optional(),
+    toDate: Joi.date().optional()
+  }),
+
+  serviceQuery: Joi.object({
+    category: Joi.string().optional(),
+    minPrice: Joi.number().positive().optional(),
+    maxPrice: Joi.number().positive().optional(),
+    search: Joi.string().optional()
+  }),
+
+  staffQuery: Joi.object({
+    specialty: Joi.string().optional(),
+    minRating: Joi.number().min(0).max(5).optional(),
+    search: Joi.string().optional(),
+    date: Joi.date().optional(),
+    time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
+    duration: Joi.number().integer().min(15).max(480).optional()
+  }),
+
+  // Parameter schemas
+  uuidParam: Joi.object({
+    id: Joi.string().uuid().required()
+  }),
+
+  availableSlotsParams: Joi.object({
+    staffId: Joi.string().uuid().required(),
+    date: Joi.date().required()
+  })
+};
+
+module.exports = {
+  validateRequest,
+  validateQuery,
+  validateParams,
+  schemas
+};
